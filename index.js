@@ -1,0 +1,126 @@
+const express = require('express');
+const https = require('https');
+const crypto = require('crypto');
+
+const app = express();
+app.use(express.json());
+
+// ─── CONFIGURAÇÕES ───────────────────────────────────────────────
+const META_PIXEL_ID     = process.env.META_PIXEL_ID     || '1190155498539686';
+const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || 'EAANDzuarwZCkBRhU3Tlz86S8IFpaza1Bf3LXc2VV6Yzf1OjCjtq1e1TRSdOtz2Fv6H2M6n0csPra1NGozbbNbzDaDRkBUYguJIY6Ec9BuzGzpCvlrlylGIaNf9rScaBVTjqoGbvx7ZCeE9Im5IO5xnamNTWNxvyZA01t5SBX8JlRXAZCO6NaKPjt5vWb5wZDZD';
+const PORT              = process.env.PORT || 3000;
+// ─────────────────────────────────────────────────────────────────
+
+function hashSHA256(value) {
+  if (!value) return undefined;
+  const clean = String(value).trim().toLowerCase();
+  if (!clean) return undefined;
+  return crypto.createHash('sha256').update(clean).digest('hex');
+}
+
+function parsePhone(phone) {
+  if (!phone) return undefined;
+  const digits = phone.replace(/\D/g, '');
+  // Garante DDI 55 no início
+  if (digits.startsWith('55') && digits.length >= 12) return digits;
+  return '55' + digits;
+}
+
+function parseDateToUnix(dateStr) {
+  if (!dateStr) return Math.floor(Date.now() / 1000);
+  const d = new Date(dateStr.replace(' ', 'T') + 'Z');
+  return isNaN(d) ? Math.floor(Date.now() / 1000) : Math.floor(d.getTime() / 1000);
+}
+
+function buildMetaPayload(pedido) {
+  const cliente  = pedido.cliente || {};
+  const pagamentos = pedido.pagamentos || [];
+  const valor    = pedido.total || pagamentos.reduce((s, p) => s + (p.valor || 0), 0);
+
+  const phone = parsePhone(cliente.whatsapp || cliente.telefone);
+  const nome  = (cliente.nome || '').trim().split(/\s+/);
+
+  const userData = {};
+  if (cliente.email)   userData.em = hashSHA256(cliente.email);
+  if (phone)           userData.ph = hashSHA256(phone);
+  if (nome[0])         userData.fn = hashSHA256(nome[0]);
+  if (nome.length > 1) userData.ln = hashSHA256(nome.slice(1).join(' '));
+  if (cliente.cidade)  userData.ct = hashSHA256(cliente.cidade);
+  if (cliente.estado)  userData.st = hashSHA256(cliente.estado.toLowerCase());
+  if (cliente.cep)     userData.zp = hashSHA256(cliente.cep.replace(/\D/g, ''));
+  userData.country = hashSHA256(cliente.pais?.toLowerCase() || 'br');
+
+  return {
+    data: [{
+      event_name:    'Purchase',
+      event_time:    parseDateToUnix(pedido.data),
+      action_source: 'physical_store',
+      user_data:     userData,
+      custom_data: {
+        value:    parseFloat(valor) || 0,
+        currency: 'BRL',
+        order_id: String(pedido.id || pedido.codigo || ''),
+      },
+    }],
+  };
+}
+
+function sendToMeta(payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const options = {
+      hostname: 'graph.facebook.com',
+      path:     `/v19.0/${META_PIXEL_ID}/events?access_token=${META_ACCESS_TOKEN}`,
+      method:   'POST',
+      headers:  {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── WEBHOOK ─────────────────────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+  try {
+    const { evento, dados } = req.body;
+    console.log(`[${new Date().toISOString()}] Evento: ${evento} | Pedido: ${dados?.id}`);
+
+    // Só processa pedidos criados ou atualizados
+    if (!['pedido_criado', 'pedido_atualizado'].includes(evento)) {
+      return res.status(200).json({ ok: true, msg: 'Evento ignorado' });
+    }
+
+    // pedido_atualizado só dispara se tiver sido marcado como pago
+    if (evento === 'pedido_atualizado' && !dados.status_pago) {
+      return res.status(200).json({ ok: true, msg: 'Pedido não pago, ignorado' });
+    }
+
+    const payload = buildMetaPayload(dados);
+    console.log('→ Meta payload:', JSON.stringify(payload, null, 2));
+
+    const result = await sendToMeta(payload);
+    console.log(`← Meta [${result.status}]:`, result.body);
+
+    return res.status(200).json({ ok: true, meta_status: result.status, meta_body: result.body });
+  } catch (err) {
+    console.error('Erro:', err.message);
+    return res.status(200).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/', (req, res) => res.json({
+  status:  'ok',
+  service: 'FacilZap → Meta Conversions API',
+  pixel:   META_PIXEL_ID,
+}));
+
+app.listen(PORT, () => console.log(`✓ Servidor na porta ${PORT}`));
