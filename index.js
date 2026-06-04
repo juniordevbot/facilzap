@@ -5,11 +5,12 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-// ─── CONFIGURAÇÕES ───────────────────────────────────────────────
 const META_PIXEL_ID     = process.env.META_PIXEL_ID     || '1190155498539686';
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || 'EAANDzuarwZCkBRhU3Tlz86S8IFpaza1Bf3LXc2VV6Yzf1OjCjtq1e1TRSdOtz2Fv6H2M6n0csPra1NGozbbNbzDaDRkBUYguJIY6Ec9BuzGzpCvlrlylGIaNf9rScaBVTjqoGbvx7ZCeE9Im5IO5xnamNTWNxvyZA01t5SBX8JlRXAZCO6NaKPjt5vWb5wZDZD';
 const PORT              = process.env.PORT || 3000;
-// ─────────────────────────────────────────────────────────────────
+
+// Controle de deduplicação: evita disparar Purchase duas vezes pro mesmo pedido
+const pedidosDisparados = new Set();
 
 function hashSHA256(value) {
   if (!value) return undefined;
@@ -21,7 +22,6 @@ function hashSHA256(value) {
 function parsePhone(phone) {
   if (!phone) return undefined;
   const digits = phone.replace(/\D/g, '');
-  // Garante DDI 55 no início
   if (digits.startsWith('55') && digits.length >= 12) return digits;
   return '55' + digits;
 }
@@ -36,18 +36,17 @@ function buildMetaPayload(pedido) {
   const cliente  = pedido.cliente || {};
   const pagamentos = pedido.pagamentos || [];
   const valor    = pedido.total || pagamentos.reduce((s, p) => s + (p.valor || 0), 0);
-
-  const phone = parsePhone(cliente.whatsapp || cliente.telefone);
-  const nome  = (cliente.nome || '').trim().split(/\s+/);
+  const nome     = (cliente.nome || '').trim().split(/\s+/);
+  const phone    = parsePhone(cliente.whatsapp || cliente.telefone);
 
   const userData = {};
-  if (cliente.email)   userData.em = hashSHA256(cliente.email);
-  if (phone)           userData.ph = hashSHA256(phone);
-  if (nome[0])         userData.fn = hashSHA256(nome[0]);
-  if (nome.length > 1) userData.ln = hashSHA256(nome.slice(1).join(' '));
-  if (cliente.cidade)  userData.ct = hashSHA256(cliente.cidade);
-  if (cliente.estado)  userData.st = hashSHA256(cliente.estado.toLowerCase());
-  if (cliente.cep)     userData.zp = hashSHA256(cliente.cep.replace(/\D/g, ''));
+  if (cliente.email) userData.em = hashSHA256(cliente.email);
+  if (phone)         userData.ph = hashSHA256(phone);
+  if (nome[0])       userData.fn = hashSHA256(nome[0]);
+  if (nome.length>1) userData.ln = hashSHA256(nome.slice(1).join(' '));
+  if (cliente.cidade) userData.ct = hashSHA256(cliente.cidade);
+  if (cliente.estado) userData.st = hashSHA256(cliente.estado.toLowerCase());
+  if (cliente.cep)    userData.zp = hashSHA256(cliente.cep.replace(/\D/g,''));
   userData.country = hashSHA256(cliente.pais?.toLowerCase() || 'br');
 
   return {
@@ -72,10 +71,7 @@ function sendToMeta(payload) {
       hostname: 'graph.facebook.com',
       path:     `/v19.0/${META_PIXEL_ID}/events?access_token=${META_ACCESS_TOKEN}`,
       method:   'POST',
-      headers:  {
-        'Content-Type':   'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
+      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     };
     const req = https.request(options, res => {
       let data = '';
@@ -88,27 +84,45 @@ function sendToMeta(payload) {
   });
 }
 
-// ─── WEBHOOK ─────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   try {
     const { evento, dados } = req.body;
-    console.log(`[${new Date().toISOString()}] Evento: ${evento} | Pedido: ${dados?.id}`);
+    const pedidoId = String(dados?.id || '');
 
-    // Só processa pedidos criados ou atualizados
-    if (!['pedido_criado', 'pedido_atualizado'].includes(evento)) {
-      return res.status(200).json({ ok: true, msg: 'Evento ignorado' });
+    console.log(`[${new Date().toISOString()}] Evento: ${evento} | Pedido: ${pedidoId}`);
+
+    // ── Filtra apenas os eventos relevantes ──────────────────────
+    const EVENTOS_ACEITOS = ['pedido_criado', 'pedido_pagamento_atualizado'];
+    if (!EVENTOS_ACEITOS.includes(evento)) {
+      console.log(`  → Ignorado (evento não relevante)`);
+      return res.status(200).json({ ok: true, msg: `Evento ${evento} ignorado` });
     }
 
-    // pedido_atualizado só dispara se tiver sido marcado como pago
-    if (evento === 'pedido_atualizado' && !dados.status_pago) {
-      return res.status(200).json({ ok: true, msg: 'Pedido não pago, ignorado' });
+    // ── Para pedido_criado: só dispara se já veio pago ───────────
+    if (evento === 'pedido_criado' && !dados.status_pago) {
+      console.log(`  → Ignorado (pedido criado mas não pago ainda)`);
+      return res.status(200).json({ ok: true, msg: 'Pedido criado sem pagamento, aguardando' });
     }
 
+    // ── Deduplicação: não dispara duas vezes pro mesmo pedido ────
+    if (pedidoId && pedidosDisparados.has(pedidoId)) {
+      console.log(`  → Ignorado (Purchase já disparado para pedido ${pedidoId})`);
+      return res.status(200).json({ ok: true, msg: 'Já disparado, ignorado' });
+    }
+
+    // ── Dispara para o Meta ──────────────────────────────────────
     const payload = buildMetaPayload(dados);
-    console.log('→ Meta payload:', JSON.stringify(payload, null, 2));
+    console.log('  → Enviando para Meta:', JSON.stringify(payload.data[0].custom_data));
 
     const result = await sendToMeta(payload);
-    console.log(`← Meta [${result.status}]:`, result.body);
+    console.log(`  ← Meta [${result.status}]:`, result.body);
+
+    // Marca como disparado
+    if (pedidoId) {
+      pedidosDisparados.add(pedidoId);
+      // Limpa da memória após 24h para não crescer indefinidamente
+      setTimeout(() => pedidosDisparados.delete(pedidoId), 24 * 60 * 60 * 1000);
+    }
 
     return res.status(200).json({ ok: true, meta_status: result.status, meta_body: result.body });
   } catch (err) {
