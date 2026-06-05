@@ -5,11 +5,10 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-const META_PIXEL_ID     = process.env.META_PIXEL_ID     || '1190155498539686';
+const META_DATASET_ID   = process.env.META_DATASET_ID   || '1190155498539686';
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || 'EAANDzuarwZCkBRhU3Tlz86S8IFpaza1Bf3LXc2VV6Yzf1OjCjtq1e1TRSdOtz2Fv6H2M6n0csPra1NGozbbNbzDaDRkBUYguJIY6Ec9BuzGzpCvlrlylGIaNf9rScaBVTjqoGbvx7ZCeE9Im5IO5xnamNTWNxvyZA01t5SBX8JlRXAZCO6NaKPjt5vWb5wZDZD';
 const PORT              = process.env.PORT || 3000;
 
-// Controle de deduplicação: evita disparar Purchase duas vezes pro mesmo pedido
 const pedidosDisparados = new Set();
 
 function hashSHA256(value) {
@@ -32,34 +31,33 @@ function parseDateToUnix(dateStr) {
   return isNaN(d) ? Math.floor(Date.now() / 1000) : Math.floor(d.getTime() / 1000);
 }
 
-function buildMetaPayload(pedido) {
-  const cliente  = pedido.cliente || {};
+function buildPayload(pedido) {
+  const cliente = pedido.cliente || {};
   const pagamentos = pedido.pagamentos || [];
-  const valor    = pedido.total || pagamentos.reduce((s, p) => s + (p.valor || 0), 0);
-  const nome     = (cliente.nome || '').trim().split(/\s+/);
-  const phone    = parsePhone(cliente.whatsapp || cliente.telefone);
+  const valor = pedido.total || pagamentos.reduce((s, p) => s + (p.valor || 0), 0);
+  const nome  = (cliente.nome || '').trim().split(/\s+/);
+  const phone = parsePhone(cliente.whatsapp_e164 || cliente.whatsapp || cliente.telefone);
 
-  const userData = {};
-  if (cliente.email) userData.em = hashSHA256(cliente.email);
-  if (phone)         userData.ph = hashSHA256(phone);
-  if (nome[0])       userData.fn = hashSHA256(nome[0]);
-  if (nome.length>1) userData.ln = hashSHA256(nome.slice(1).join(' '));
-  if (cliente.cidade) userData.ct = hashSHA256(cliente.cidade);
-  if (cliente.estado) userData.st = hashSHA256(cliente.estado.toLowerCase());
-  if (cliente.cep)    userData.zp = hashSHA256(cliente.cep.replace(/\D/g,''));
-  userData.country = hashSHA256(cliente.pais?.toLowerCase() || 'br');
+  const match_keys = [];
+
+  if (phone)         match_keys.push({ key: 'PHONE',      value: hashSHA256(phone) });
+  if (cliente.email) match_keys.push({ key: 'EMAIL',      value: hashSHA256(cliente.email) });
+  if (nome[0])       match_keys.push({ key: 'FN',         value: hashSHA256(nome[0]) });
+  if (nome.length>1) match_keys.push({ key: 'LN',         value: hashSHA256(nome.slice(1).join(' ')) });
+  if (cliente.cep)   match_keys.push({ key: 'ZIP',        value: hashSHA256(cliente.cep.replace(/\D/g,'')) });
+  if (cliente.cidade)match_keys.push({ key: 'CT',         value: hashSHA256(cliente.cidade) });
+  if (cliente.estado)match_keys.push({ key: 'ST',         value: hashSHA256(cliente.estado.toLowerCase()) });
+                     match_keys.push({ key: 'COUNTRY',    value: hashSHA256('br') });
 
   return {
+    upload_tag: `facilzap_${pedido.id}`,
     data: [{
-      event_name:    'Purchase',
-      event_time:    parseDateToUnix(pedido.data),
-      action_source: 'physical_store',
-      user_data:     userData,
-      custom_data: {
-        value:    parseFloat(valor) || 0,
-        currency: 'BRL',
-        order_id: String(pedido.id || pedido.codigo || ''),
-      },
+      match_keys,
+      event_name:  'Purchase',
+      event_time:  parseDateToUnix(pedido.data),
+      value:       parseFloat(valor) || 0,
+      currency:    'BRL',
+      order_id:    String(pedido.id || pedido.codigo || ''),
     }],
   };
 }
@@ -69,7 +67,7 @@ function sendToMeta(payload) {
     const body = JSON.stringify(payload);
     const options = {
       hostname: 'graph.facebook.com',
-      path:     `/v19.0/${META_PIXEL_ID}/events?access_token=${META_ACCESS_TOKEN}`,
+      path:     `/v19.0/${META_DATASET_ID}/events?access_token=${META_ACCESS_TOKEN}`,
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     };
@@ -91,36 +89,27 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] Evento: ${evento} | Pedido: ${pedidoId}`);
 
-    // ── Filtra apenas os eventos relevantes ──────────────────────
     const EVENTOS_ACEITOS = ['pedido_criado', 'pedido_pagamento_atualizado'];
     if (!EVENTOS_ACEITOS.includes(evento)) {
-      console.log(`  → Ignorado (evento não relevante)`);
-      return res.status(200).json({ ok: true, msg: `Evento ${evento} ignorado` });
+      return res.status(200).json({ ok: true, msg: `Ignorado: ${evento}` });
     }
 
-    // ── Para pedido_criado: só dispara se já veio pago ───────────
     if (evento === 'pedido_criado' && !dados.status_pago) {
-      console.log(`  → Ignorado (pedido criado mas não pago ainda)`);
       return res.status(200).json({ ok: true, msg: 'Pedido criado sem pagamento, aguardando' });
     }
 
-    // ── Deduplicação: não dispara duas vezes pro mesmo pedido ────
     if (pedidoId && pedidosDisparados.has(pedidoId)) {
-      console.log(`  → Ignorado (Purchase já disparado para pedido ${pedidoId})`);
       return res.status(200).json({ ok: true, msg: 'Já disparado, ignorado' });
     }
 
-    // ── Dispara para o Meta ──────────────────────────────────────
-    const payload = buildMetaPayload(dados);
-    console.log('  → Enviando para Meta:', JSON.stringify(payload.data[0].custom_data));
+    const payload = buildPayload(dados);
+    console.log('  → Enviando offline event:', JSON.stringify({ order_id: payload.data[0].order_id, value: payload.data[0].value }));
 
     const result = await sendToMeta(payload);
     console.log(`  ← Meta [${result.status}]:`, result.body);
 
-    // Marca como disparado
     if (pedidoId) {
       pedidosDisparados.add(pedidoId);
-      // Limpa da memória após 24h para não crescer indefinidamente
       setTimeout(() => pedidosDisparados.delete(pedidoId), 24 * 60 * 60 * 1000);
     }
 
@@ -133,8 +122,8 @@ app.post('/webhook', async (req, res) => {
 
 app.get('/', (req, res) => res.json({
   status:  'ok',
-  service: 'FacilZap → Meta Conversions API',
-  pixel:   META_PIXEL_ID,
+  service: 'FacilZap → Meta Offline Conversions API',
+  dataset: META_DATASET_ID,
 }));
 
 app.listen(PORT, () => console.log(`✓ Servidor na porta ${PORT}`));
